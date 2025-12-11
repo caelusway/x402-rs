@@ -54,6 +54,9 @@ pub enum Network {
     /// Sei testnet (chain ID 1328).
     #[serde(rename = "sei-testnet")]
     SeiTestnet,
+    /// BNB Smart Chain testnet (chain ID 97).
+    #[serde(rename = "bnb-testnet")]
+    BnbTestnet,
 }
 
 impl Display for Network {
@@ -71,6 +74,7 @@ impl Display for Network {
             Network::Polygon => write!(f, "polygon"),
             Network::Sei => write!(f, "sei"),
             Network::SeiTestnet => write!(f, "sei-testnet"),
+            Network::BnbTestnet => write!(f, "bnb-testnet"),
         }
     }
 }
@@ -96,6 +100,7 @@ impl From<Network> for NetworkFamily {
             Network::Polygon => NetworkFamily::Evm,
             Network::Sei => NetworkFamily::Evm,
             Network::SeiTestnet => NetworkFamily::Evm,
+            Network::BnbTestnet => NetworkFamily::Evm,
         }
     }
 }
@@ -116,6 +121,7 @@ impl Network {
             Network::Polygon,
             Network::Sei,
             Network::SeiTestnet,
+            Network::BnbTestnet,
         ]
     }
 }
@@ -282,6 +288,21 @@ static USDC_SEI_TESTNET: Lazy<USDCDeployment> = Lazy::new(|| {
     })
 });
 
+/// Lazily initialized known USDC deployment on BNB Smart Chain testnet as [`USDCDeployment`].
+static USDC_BNB_TESTNET: Lazy<USDCDeployment> = Lazy::new(|| {
+    USDCDeployment(TokenDeployment {
+        asset: TokenAsset {
+            address: address!("0x64544969ed7EBf5f083679233325356EbE738930").into(),
+            network: Network::BnbTestnet,
+        },
+        decimals: 6,
+        eip712: Some(TokenDeploymentEip712 {
+            name: "USDC".into(),
+            version: "2".into(),
+        }),
+    })
+});
+
 /// A known USDC deployment as a wrapper around [`TokenDeployment`].
 #[derive(Clone, Debug)]
 pub struct USDCDeployment(pub TokenDeployment);
@@ -343,6 +364,7 @@ impl USDCDeployment {
             Network::Polygon => &USDC_POLYGON,
             Network::Sei => &USDC_SEI,
             Network::SeiTestnet => &USDC_SEI_TESTNET,
+            Network::BnbTestnet => &USDC_BNB_TESTNET,
         }
     }
 }
