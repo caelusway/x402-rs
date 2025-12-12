@@ -136,6 +136,7 @@ impl TryFrom<Network> for EvmChain {
             Network::Sei => Ok(EvmChain::new(value, 1329)),
             Network::SeiTestnet => Ok(EvmChain::new(value, 1328)),
             Network::BnbTestnet => Ok(EvmChain::new(value, 97)),
+            Network::Bnb => Ok(EvmChain::new(value, 56)),
         }
     }
 }
@@ -416,6 +417,7 @@ impl FromEnvByNetworkBuild for EvmProvider {
             Network::Sei => true,
             Network::SeiTestnet => true,
             Network::BnbTestnet => false,
+            Network::Bnb => false,
         };
         let provider = EvmProvider::try_new(wallet, &rpc_url, is_eip1559, network).await?;
         Ok(Some(provider))

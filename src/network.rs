@@ -57,6 +57,9 @@ pub enum Network {
     /// BNB Smart Chain testnet (chain ID 97).
     #[serde(rename = "bnb-testnet")]
     BnbTestnet,
+    /// BNB Smart Chain mainnet (chain ID 56).
+    #[serde(rename = "bnb")]
+    Bnb,
 }
 
 impl Display for Network {
@@ -75,6 +78,7 @@ impl Display for Network {
             Network::Sei => write!(f, "sei"),
             Network::SeiTestnet => write!(f, "sei-testnet"),
             Network::BnbTestnet => write!(f, "bnb-testnet"),
+            Network::Bnb => write!(f, "bnb"),
         }
     }
 }
@@ -101,6 +105,7 @@ impl From<Network> for NetworkFamily {
             Network::Sei => NetworkFamily::Evm,
             Network::SeiTestnet => NetworkFamily::Evm,
             Network::BnbTestnet => NetworkFamily::Evm,
+            Network::Bnb => NetworkFamily::Evm,
         }
     }
 }
@@ -122,6 +127,7 @@ impl Network {
             Network::Sei,
             Network::SeiTestnet,
             Network::BnbTestnet,
+            Network::Bnb,
         ]
     }
 }
@@ -303,6 +309,21 @@ static USDC_BNB_TESTNET: Lazy<USDCDeployment> = Lazy::new(|| {
     })
 });
 
+/// Lazily initialized known USDC deployment on BNB Smart Chain mainnet as [`USDCDeployment`].
+static USDC_BNB: Lazy<USDCDeployment> = Lazy::new(|| {
+    USDCDeployment(TokenDeployment {
+        asset: TokenAsset {
+            address: address!("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d").into(),
+            network: Network::Bnb,
+        },
+        decimals: 18,
+        eip712: Some(TokenDeploymentEip712 {
+            name: "USD Coin".into(),
+            version: "1".into(),
+        }),
+    })
+});
+
 /// A known USDC deployment as a wrapper around [`TokenDeployment`].
 #[derive(Clone, Debug)]
 pub struct USDCDeployment(pub TokenDeployment);
@@ -365,6 +386,7 @@ impl USDCDeployment {
             Network::Sei => &USDC_SEI,
             Network::SeiTestnet => &USDC_SEI_TESTNET,
             Network::BnbTestnet => &USDC_BNB_TESTNET,
+            Network::Bnb => &USDC_BNB,
         }
     }
 }
