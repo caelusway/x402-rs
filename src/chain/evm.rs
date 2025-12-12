@@ -47,9 +47,10 @@ use crate::from_env;
 use crate::network::{Network, USDCDeployment};
 use crate::timestamp::UnixTimestamp;
 use crate::types::{
-    EvmAddress, EvmSignature, ExactPaymentPayload, FacilitatorErrorReason, HexEncodedNonce,
-    MixedAddress, PaymentPayload, PaymentRequirements, Scheme, SettleRequest, SettleResponse,
-    SupportedPaymentKind, SupportedPaymentKindsResponse, TokenAmount, TransactionHash,
+    AllowancePaymentPayload, AllowanceTransfer, EvmAddress, EvmSignature, ExactPaymentPayload,
+    FacilitatorErrorReason, HexEncodedNonce, MixedAddress, PaymentPayload, PaymentRequirements,
+    Scheme, SchemePayload, SettleRequest, SettleResponse, SupportedPaymentKind,
+    SupportedPaymentKindExtra, SupportedPaymentKindsResponse, TokenAmount, TransactionHash,
     TransferWithAuthorization, VerifyRequest, VerifyResponse, X402Version,
 };
 
@@ -162,6 +163,26 @@ pub struct ExactEvmPayment {
     pub signature: EvmSignature,
 }
 
+/// A fully specified allowance-based authorization payload for EVM settlement.
+/// Used on chains like BNB where USDC doesn't support ERC-3009.
+pub struct AllowanceEvmPayment {
+    /// Target chain for settlement.
+    #[allow(dead_code)]
+    pub chain: EvmChain,
+    /// Authorized sender (`from`) — must have approved the facilitator.
+    pub from: EvmAddress,
+    /// Authorized recipient (`to`).
+    pub to: EvmAddress,
+    /// Transfer amount (token units).
+    pub value: TokenAmount,
+    /// Not valid at/after this timestamp (exclusive).
+    pub valid_before: UnixTimestamp,
+    /// Unique 32-byte nonce (prevents replay of authorization).
+    pub nonce: HexEncodedNonce,
+    /// Signature proving user intent for this specific transfer.
+    pub signature: EvmSignature,
+}
+
 /// EVM implementation of the x402 facilitator.
 ///
 /// Holds a composed Alloy ethereum provider [`InnerProvider`],
@@ -260,6 +281,8 @@ pub trait MetaEvmProvider {
     fn inner(&self) -> &Self::Inner;
     /// Returns reference to chain descriptor.
     fn chain(&self) -> &EvmChain;
+    /// Returns the default signer address used for sending transactions.
+    fn default_signer_address(&self) -> Address;
 
     /// Sends a meta-transaction to the network.
     fn send_transaction(
@@ -288,6 +311,10 @@ impl MetaEvmProvider for EvmProvider {
 
     fn chain(&self) -> &EvmChain {
         &self.chain
+    }
+
+    fn default_signer_address(&self) -> Address {
+        self.inner.default_signer_address()
     }
 
     /// Send a meta-transaction with provided `to`, `calldata`, and automatically selected signer.
@@ -431,108 +458,183 @@ where
 {
     type Error = FacilitatorLocalError;
 
-    /// Verify x402 payment intent by simulating signature validity and ERC-3009 transfer.
+    /// Verify x402 payment intent by simulating signature validity and transfer.
     ///
-    /// For EIP-6492 signatures, perform a multicall: first the validator’s
-    /// `isValidSigWithSideEffects` (which *may* deploy the counterfactual wallet in sim),
-    /// then the token’s `transferWithAuthorization`. Both run within a single `eth_call`
-    /// so the state is shared during simulation.
+    /// Routes to either exact (ERC-3009) or allowance-based verification based on scheme.
     ///
     /// # Errors
     /// - [`FacilitatorLocalError::NetworkMismatch`], [`FacilitatorLocalError::SchemeMismatch`], [`FacilitatorLocalError::ReceiverMismatch`] if inputs are inconsistent.
-    /// - [`FacilitatorLocalError::InvalidTiming`] if outside `validAfter/validBefore`.
+    /// - [`FacilitatorLocalError::InvalidTiming`] if outside validity window.
     /// - [`FacilitatorLocalError::InsufficientFunds`] / `FacilitatorLocalError::InsufficientValue` on balance/value checks.
+    /// - [`FacilitatorLocalError::InsufficientAllowance`] if user hasn't approved enough (allowance scheme).
     /// - [`FacilitatorLocalError::ContractCall`] if on-chain calls revert.
     async fn verify(&self, request: &VerifyRequest) -> Result<VerifyResponse, Self::Error> {
         let payload = &request.payment_payload;
         let requirements = &request.payment_requirements;
-        let (contract, payment, eip712_domain) =
-            assert_valid_payment(self.inner(), self.chain(), payload, requirements).await?;
 
-        let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
-        let payer = signed_message.address;
-        let hash = signed_message.hash;
-        match signed_message.signature {
-            StructuredSignature::EIP6492 {
-                factory: _,
-                factory_calldata: _,
-                inner,
-                original,
-            } => {
-                // Prepare the call to validate EIP-6492 signature
-                let validator6492 = Validator6492::new(VALIDATOR_ADDRESS, self.inner());
-                let is_valid_signature_call =
-                    validator6492.isValidSigWithSideEffects(payer, hash, original);
-                // Prepare the call to simulate transfer the funds
-                let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
-                // Execute both calls in a single transaction simulation to accommodate for possible smart wallet creation
-                let (is_valid_signature_result, transfer_result) = self
-                    .inner()
-                    .multicall()
-                    .add(is_valid_signature_call)
-                    .add(transfer_call.tx)
-                    .aggregate3()
-                    .instrument(tracing::info_span!("call_transferWithAuthorization_0",
-                            from = %transfer_call.from,
-                            to = %transfer_call.to,
-                            value = %transfer_call.value,
-                            valid_after = %transfer_call.valid_after,
-                            valid_before = %transfer_call.valid_before,
-                            nonce = %transfer_call.nonce,
-                            signature = %transfer_call.signature,
-                            token_contract = %transfer_call.contract_address,
-                            otel.kind = "client",
-                    ))
-                    .await
-                    .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
-                let is_valid_signature_result = is_valid_signature_result
-                    .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
-                if !is_valid_signature_result {
-                    return Err(FacilitatorLocalError::InvalidSignature(
-                        payer.into(),
-                        "Incorrect signature".to_string(),
-                    ));
+        // Route based on requirements.scheme since that's what the resource server expects
+        match requirements.scheme {
+            Scheme::Exact => {
+                // ERC-3009 transferWithAuthorization flow
+                let (contract, payment, eip712_domain) =
+                    assert_valid_payment(self.inner(), self.chain(), payload, requirements).await?;
+
+                let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
+                let payer = signed_message.address;
+                let hash = signed_message.hash;
+                match signed_message.signature {
+                    StructuredSignature::EIP6492 {
+                        factory: _,
+                        factory_calldata: _,
+                        inner,
+                        original,
+                    } => {
+                        // Prepare the call to validate EIP-6492 signature
+                        let validator6492 = Validator6492::new(VALIDATOR_ADDRESS, self.inner());
+                        let is_valid_signature_call =
+                            validator6492.isValidSigWithSideEffects(payer, hash, original);
+                        // Prepare the call to simulate transfer the funds
+                        let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
+                        // Execute both calls in a single transaction simulation to accommodate for possible smart wallet creation
+                        let (is_valid_signature_result, transfer_result) = self
+                            .inner()
+                            .multicall()
+                            .add(is_valid_signature_call)
+                            .add(transfer_call.tx)
+                            .aggregate3()
+                            .instrument(tracing::info_span!("call_transferWithAuthorization_0",
+                                    from = %transfer_call.from,
+                                    to = %transfer_call.to,
+                                    value = %transfer_call.value,
+                                    valid_after = %transfer_call.valid_after,
+                                    valid_before = %transfer_call.valid_before,
+                                    nonce = %transfer_call.nonce,
+                                    signature = %transfer_call.signature,
+                                    token_contract = %transfer_call.contract_address,
+                                    otel.kind = "client",
+                            ))
+                            .await
+                            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+                        let is_valid_signature_result = is_valid_signature_result
+                            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+                        if !is_valid_signature_result {
+                            return Err(FacilitatorLocalError::InvalidSignature(
+                                payer.into(),
+                                "Incorrect signature".to_string(),
+                            ));
+                        }
+                        transfer_result.map_err(|e| FacilitatorLocalError::ContractCall(format!("{e}")))?;
+                    }
+                    StructuredSignature::EIP1271(signature) => {
+                        // It is EOA or EIP-1271 signature, which we can pass to the transfer simulation
+                        let transfer_call =
+                            transferWithAuthorization_0(&contract, &payment, signature).await?;
+                        transfer_call
+                            .tx
+                            .call()
+                            .into_future()
+                            .instrument(tracing::info_span!("call_transferWithAuthorization_0",
+                                    from = %transfer_call.from,
+                                    to = %transfer_call.to,
+                                    value = %transfer_call.value,
+                                    valid_after = %transfer_call.valid_after,
+                                    valid_before = %transfer_call.valid_before,
+                                    nonce = %transfer_call.nonce,
+                                    signature = %transfer_call.signature,
+                                    token_contract = %transfer_call.contract_address,
+                                    otel.kind = "client",
+                            ))
+                            .await
+                            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+                    }
                 }
-                transfer_result.map_err(|e| FacilitatorLocalError::ContractCall(format!("{e}")))?;
+
+                Ok(VerifyResponse::valid(payer.into()))
             }
-            StructuredSignature::EIP1271(signature) => {
-                // It is EOA or EIP-1271 signature, which we can pass to the transfer simulation
-                let transfer_call =
-                    transferWithAuthorization_0(&contract, &payment, signature).await?;
+            Scheme::Allowance => {
+                // Allowance-based transferFrom flow (BNB Chain)
+                let facilitator_address = self.default_signer_address();
+                let (contract, payment, eip712_domain) =
+                    assert_valid_allowance_payment(
+                        self.inner(),
+                        self.chain(),
+                        payload,
+                        requirements,
+                        &facilitator_address,
+                    )
+                    .await?;
+
+                // Verify the signature on the AllowanceTransfer struct
+                let signed_message = SignedMessage::extract_allowance(&payment, &eip712_domain)?;
+                let payer = signed_message.address;
+                let hash = signed_message.hash;
+
+                // For allowance scheme, only EOA signatures are supported (no EIP-6492)
+                match signed_message.signature {
+                    StructuredSignature::EIP6492 { .. } => {
+                        return Err(FacilitatorLocalError::InvalidSignature(
+                            payer.into(),
+                            "EIP-6492 signatures not supported for allowance scheme".to_string(),
+                        ));
+                    }
+                    StructuredSignature::EIP1271(signature) => {
+                        // Recover signer from signature and verify it matches expected payer
+                        let recovered = alloy::signers::Signature::try_from(signature.as_ref())
+                            .map_err(|e| {
+                                FacilitatorLocalError::InvalidSignature(
+                                    payer.into(),
+                                    format!("Failed to parse signature: {e}"),
+                                )
+                            })?
+                            .recover_address_from_prehash(&hash)
+                            .map_err(|e| {
+                                FacilitatorLocalError::InvalidSignature(
+                                    payer.into(),
+                                    format!("Failed to recover signer: {e}"),
+                                )
+                            })?;
+
+                        if recovered != payer {
+                            return Err(FacilitatorLocalError::InvalidSignature(
+                                payer.into(),
+                                format!("Signer mismatch: expected {payer}, got {recovered}"),
+                            ));
+                        }
+                    }
+                }
+
+                // Simulate the transferFrom call to verify it would succeed
+                let transfer_call = transfer_from(&contract, &payment).await?;
                 transfer_call
                     .tx
                     .call()
                     .into_future()
-                    .instrument(tracing::info_span!("call_transferWithAuthorization_0",
-                            from = %transfer_call.from,
-                            to = %transfer_call.to,
-                            value = %transfer_call.value,
-                            valid_after = %transfer_call.valid_after,
-                            valid_before = %transfer_call.valid_before,
-                            nonce = %transfer_call.nonce,
-                            signature = %transfer_call.signature,
-                            token_contract = %transfer_call.contract_address,
-                            otel.kind = "client",
+                    .instrument(tracing::info_span!("call_transferFrom",
+                        from = %transfer_call.from,
+                        to = %transfer_call.to,
+                        value = %transfer_call.value,
+                        token_contract = %transfer_call.contract_address,
+                        otel.kind = "client",
                     ))
                     .await
                     .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+
+                Ok(VerifyResponse::valid(payer.into()))
             }
         }
-
-        Ok(VerifyResponse::valid(payer.into()))
     }
 
     /// Settle a verified payment on-chain.
     ///
-    /// If the signer is counterfactual (EIP-6492) and the wallet is not yet deployed,
-    /// this submits **one** transaction to Multicall3 (`aggregate3`) that:
-    /// 1) calls the 6492 factory with the provided calldata (best-effort prepare),
-    /// 2) calls `transferWithAuthorization` with the **inner** signature.
+    /// Routes to either exact (ERC-3009) or allowance-based settlement based on scheme.
     ///
-    /// This makes deploy + transfer atomic and avoids read-your-write issues.
+    /// For exact scheme with EIP-6492 signatures:
+    /// - If the wallet is not yet deployed, submits one transaction to Multicall3 that
+    ///   deploys the wallet and transfers in a single atomic operation.
+    /// - If deployed, submits a single `transferWithAuthorization` transaction.
     ///
-    /// If the wallet is already deployed (or the signature is plain EIP-1271/EOA),
-    /// we submit a single `transferWithAuthorization` transaction.
+    /// For allowance scheme:
+    /// - Submits a single `transferFrom` transaction.
     ///
     /// # Returns
     /// A [`SettleResponse`] containing success flag and transaction hash.
@@ -543,141 +645,263 @@ where
     async fn settle(&self, request: &SettleRequest) -> Result<SettleResponse, Self::Error> {
         let payload = &request.payment_payload;
         let requirements = &request.payment_requirements;
-        let (contract, payment, eip712_domain) =
-            assert_valid_payment(self.inner(), self.chain(), payload, requirements).await?;
 
-        let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
-        let payer = signed_message.address;
-        let transaction_receipt_fut = match signed_message.signature {
-            StructuredSignature::EIP6492 {
-                factory,
-                factory_calldata,
-                inner,
-                original: _,
-            } => {
-                let is_contract_deployed = is_contract_deployed(self.inner(), &payer).await?;
-                let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
-                if is_contract_deployed {
-                    // transferWithAuthorization with inner signature
-                    self.send_transaction(MetaTransaction {
+        // Route based on requirements.scheme since that's what the resource server expects
+        match requirements.scheme {
+            Scheme::Exact => {
+                // ERC-3009 transferWithAuthorization flow
+                let (contract, payment, eip712_domain) =
+                    assert_valid_payment(self.inner(), self.chain(), payload, requirements).await?;
+
+                let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
+                let payer = signed_message.address;
+                let transaction_receipt_fut = match signed_message.signature {
+                    StructuredSignature::EIP6492 {
+                        factory,
+                        factory_calldata,
+                        inner,
+                        original: _,
+                    } => {
+                        let is_contract_deployed = is_contract_deployed(self.inner(), &payer).await?;
+                        let transfer_call = transferWithAuthorization_0(&contract, &payment, inner).await?;
+                        if is_contract_deployed {
+                            // transferWithAuthorization with inner signature
+                            self.send_transaction(MetaTransaction {
+                                to: transfer_call.tx.target(),
+                                calldata: transfer_call.tx.calldata().clone(),
+                                confirmations: 1,
+                            })
+                            .instrument(
+                                tracing::info_span!("call_transferWithAuthorization_0",
+                                    from = %transfer_call.from,
+                                    to = %transfer_call.to,
+                                    value = %transfer_call.value,
+                                    valid_after = %transfer_call.valid_after,
+                                    valid_before = %transfer_call.valid_before,
+                                    nonce = %transfer_call.nonce,
+                                    signature = %transfer_call.signature,
+                                    token_contract = %transfer_call.contract_address,
+                                    sig_kind="EIP6492.deployed",
+                                    otel.kind = "client",
+                                ),
+                            )
+                        } else {
+                            // deploy the smart wallet, and transferWithAuthorization with inner signature
+                            let deployment_call = IMulticall3::Call3 {
+                                allowFailure: true,
+                                target: factory,
+                                callData: factory_calldata,
+                            };
+                            let transfer_with_authorization_call = IMulticall3::Call3 {
+                                allowFailure: false,
+                                target: transfer_call.tx.target(),
+                                callData: transfer_call.tx.calldata().clone(),
+                            };
+                            let aggregate_call = IMulticall3::aggregate3Call {
+                                calls: vec![deployment_call, transfer_with_authorization_call],
+                            };
+                            self.send_transaction(MetaTransaction {
+                                to: MULTICALL3_ADDRESS,
+                                calldata: aggregate_call.abi_encode().into(),
+                                confirmations: 1,
+                            })
+                            .instrument(
+                                tracing::info_span!("call_transferWithAuthorization_0",
+                                    from = %transfer_call.from,
+                                    to = %transfer_call.to,
+                                    value = %transfer_call.value,
+                                    valid_after = %transfer_call.valid_after,
+                                    valid_before = %transfer_call.valid_before,
+                                    nonce = %transfer_call.nonce,
+                                    signature = %transfer_call.signature,
+                                    token_contract = %transfer_call.contract_address,
+                                    sig_kind="EIP6492.counterfactual",
+                                    otel.kind = "client",
+                                ),
+                            )
+                        }
+                    }
+                    StructuredSignature::EIP1271(eip1271_signature) => {
+                        let transfer_call =
+                            transferWithAuthorization_0(&contract, &payment, eip1271_signature).await?;
+                        // transferWithAuthorization with eip1271 signature
+                        self.send_transaction(MetaTransaction {
+                            to: transfer_call.tx.target(),
+                            calldata: transfer_call.tx.calldata().clone(),
+                            confirmations: 1,
+                        })
+                        .instrument(
+                            tracing::info_span!("call_transferWithAuthorization_0",
+                                from = %transfer_call.from,
+                                to = %transfer_call.to,
+                                value = %transfer_call.value,
+                                valid_after = %transfer_call.valid_after,
+                                valid_before = %transfer_call.valid_before,
+                                nonce = %transfer_call.nonce,
+                                signature = %transfer_call.signature,
+                                token_contract = %transfer_call.contract_address,
+                                sig_kind="EIP1271",
+                                otel.kind = "client",
+                            ),
+                        )
+                    }
+                };
+                let receipt = transaction_receipt_fut.await?;
+                let success = receipt.status();
+                if success {
+                    tracing::event!(Level::INFO,
+                        status = "ok",
+                        tx = %receipt.transaction_hash,
+                        "transferWithAuthorization_0 succeeded"
+                    );
+                    Ok(SettleResponse {
+                        success: true,
+                        error_reason: None,
+                        payer: payment.from.into(),
+                        transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                        network: payload.network,
+                    })
+                } else {
+                    tracing::event!(
+                        Level::WARN,
+                        status = "failed",
+                        tx = %receipt.transaction_hash,
+                        "transferWithAuthorization_0 failed"
+                    );
+                    Ok(SettleResponse {
+                        success: false,
+                        error_reason: Some(FacilitatorErrorReason::InvalidScheme),
+                        payer: payment.from.into(),
+                        transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                        network: payload.network,
+                    })
+                }
+            }
+            Scheme::Allowance => {
+                // Allowance-based transferFrom flow (BNB Chain)
+                let facilitator_address = self.default_signer_address();
+                let (contract, payment, eip712_domain) =
+                    assert_valid_allowance_payment(
+                        self.inner(),
+                        self.chain(),
+                        payload,
+                        requirements,
+                        &facilitator_address,
+                    )
+                    .await?;
+
+                // Verify the signature
+                let signed_message = SignedMessage::extract_allowance(&payment, &eip712_domain)?;
+                let payer = signed_message.address;
+                let hash = signed_message.hash;
+
+                match signed_message.signature {
+                    StructuredSignature::EIP6492 { .. } => {
+                        return Err(FacilitatorLocalError::InvalidSignature(
+                            payer.into(),
+                            "EIP-6492 signatures not supported for allowance scheme".to_string(),
+                        ));
+                    }
+                    StructuredSignature::EIP1271(signature) => {
+                        // Recover signer from signature and verify it matches expected payer
+                        let recovered = alloy::signers::Signature::try_from(signature.as_ref())
+                            .map_err(|e| {
+                                FacilitatorLocalError::InvalidSignature(
+                                    payer.into(),
+                                    format!("Failed to parse signature: {e}"),
+                                )
+                            })?
+                            .recover_address_from_prehash(&hash)
+                            .map_err(|e| {
+                                FacilitatorLocalError::InvalidSignature(
+                                    payer.into(),
+                                    format!("Failed to recover signer: {e}"),
+                                )
+                            })?;
+
+                        if recovered != payer {
+                            return Err(FacilitatorLocalError::InvalidSignature(
+                                payer.into(),
+                                format!("Signer mismatch: expected {payer}, got {recovered}"),
+                            ));
+                        }
+                    }
+                }
+
+                // Execute the transferFrom call
+                let transfer_call = transfer_from(&contract, &payment).await?;
+                let receipt = self
+                    .send_transaction(MetaTransaction {
                         to: transfer_call.tx.target(),
                         calldata: transfer_call.tx.calldata().clone(),
                         confirmations: 1,
                     })
-                    .instrument(
-                        tracing::info_span!("call_transferWithAuthorization_0",
-                            from = %transfer_call.from,
-                            to = %transfer_call.to,
-                            value = %transfer_call.value,
-                            valid_after = %transfer_call.valid_after,
-                            valid_before = %transfer_call.valid_before,
-                            nonce = %transfer_call.nonce,
-                            signature = %transfer_call.signature,
-                            token_contract = %transfer_call.contract_address,
-                            sig_kind="EIP6492.deployed",
-                            otel.kind = "client",
-                        ),
-                    )
-                } else {
-                    // deploy the smart wallet, and transferWithAuthorization with inner signature
-                    let deployment_call = IMulticall3::Call3 {
-                        allowFailure: true,
-                        target: factory,
-                        callData: factory_calldata,
-                    };
-                    let transfer_with_authorization_call = IMulticall3::Call3 {
-                        allowFailure: false,
-                        target: transfer_call.tx.target(),
-                        callData: transfer_call.tx.calldata().clone(),
-                    };
-                    let aggregate_call = IMulticall3::aggregate3Call {
-                        calls: vec![deployment_call, transfer_with_authorization_call],
-                    };
-                    self.send_transaction(MetaTransaction {
-                        to: MULTICALL3_ADDRESS,
-                        calldata: aggregate_call.abi_encode().into(),
-                        confirmations: 1,
-                    })
-                    .instrument(
-                        tracing::info_span!("call_transferWithAuthorization_0",
-                            from = %transfer_call.from,
-                            to = %transfer_call.to,
-                            value = %transfer_call.value,
-                            valid_after = %transfer_call.valid_after,
-                            valid_before = %transfer_call.valid_before,
-                            nonce = %transfer_call.nonce,
-                            signature = %transfer_call.signature,
-                            token_contract = %transfer_call.contract_address,
-                            sig_kind="EIP6492.counterfactual",
-                            otel.kind = "client",
-                        ),
-                    )
-                }
-            }
-            StructuredSignature::EIP1271(eip1271_signature) => {
-                let transfer_call =
-                    transferWithAuthorization_0(&contract, &payment, eip1271_signature).await?;
-                // transferWithAuthorization with eip1271 signature
-                self.send_transaction(MetaTransaction {
-                    to: transfer_call.tx.target(),
-                    calldata: transfer_call.tx.calldata().clone(),
-                    confirmations: 1,
-                })
-                .instrument(
-                    tracing::info_span!("call_transferWithAuthorization_0",
+                    .instrument(tracing::info_span!("call_transferFrom",
                         from = %transfer_call.from,
                         to = %transfer_call.to,
                         value = %transfer_call.value,
-                        valid_after = %transfer_call.valid_after,
-                        valid_before = %transfer_call.valid_before,
-                        nonce = %transfer_call.nonce,
-                        signature = %transfer_call.signature,
                         token_contract = %transfer_call.contract_address,
-                        sig_kind="EIP1271",
                         otel.kind = "client",
-                    ),
-                )
+                    ))
+                    .await?;
+
+                let success = receipt.status();
+                if success {
+                    tracing::event!(Level::INFO,
+                        status = "ok",
+                        tx = %receipt.transaction_hash,
+                        "transferFrom succeeded"
+                    );
+                    Ok(SettleResponse {
+                        success: true,
+                        error_reason: None,
+                        payer: payment.from.into(),
+                        transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                        network: payload.network,
+                    })
+                } else {
+                    tracing::event!(
+                        Level::WARN,
+                        status = "failed",
+                        tx = %receipt.transaction_hash,
+                        "transferFrom failed"
+                    );
+                    Ok(SettleResponse {
+                        success: false,
+                        error_reason: Some(FacilitatorErrorReason::UnexpectedSettleError),
+                        payer: payment.from.into(),
+                        transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                        network: payload.network,
+                    })
+                }
             }
-        };
-        let receipt = transaction_receipt_fut.await?;
-        let success = receipt.status();
-        if success {
-            tracing::event!(Level::INFO,
-                status = "ok",
-                tx = %receipt.transaction_hash,
-                "transferWithAuthorization_0 succeeded"
-            );
-            Ok(SettleResponse {
-                success: true,
-                error_reason: None,
-                payer: payment.from.into(),
-                transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
-                network: payload.network,
-            })
-        } else {
-            tracing::event!(
-                Level::WARN,
-                status = "failed",
-                tx = %receipt.transaction_hash,
-                "transferWithAuthorization_0 failed"
-            );
-            Ok(SettleResponse {
-                success: false,
-                error_reason: Some(FacilitatorErrorReason::InvalidScheme),
-                payer: payment.from.into(),
-                transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
-                network: payload.network,
-            })
         }
     }
 
     /// Report payment kinds supported by this provider on its current network.
     async fn supported(&self) -> Result<SupportedPaymentKindsResponse, Self::Error> {
+        // Determine which scheme this network supports
+        let scheme = match self.chain().network() {
+            Network::BnbTestnet | Network::Bnb => Scheme::Allowance,
+            _ => Scheme::Exact,
+        };
+
+        let extra = if scheme == Scheme::Allowance {
+            // For allowance scheme, include the facilitator address that users must approve
+            let facilitator_address = self.default_signer_address();
+            Some(SupportedPaymentKindExtra {
+                fee_payer: None,
+                facilitator_address: Some(facilitator_address.into()),
+            })
+        } else {
+            None
+        };
+
         let kinds = vec![SupportedPaymentKind {
             network: self.chain().network().to_string(),
             x402_version: X402Version::V1,
-            scheme: Scheme::Exact,
-            extra: None,
+            scheme,
+            extra,
         }];
         Ok(SupportedPaymentKindsResponse { kinds })
     }
@@ -706,6 +930,23 @@ pub struct TransferWithAuthorization0Call<P> {
     pub nonce: FixedBytes<32>,
     /// EIP-712 signature for the transfer authorization.
     pub signature: Bytes,
+    /// Address of the token contract used for this transfer.
+    pub contract_address: alloy::primitives::Address,
+}
+
+/// A prepared call to `transferFrom` (ERC-20) for allowance-based transfers.
+///
+/// Used on chains like BNB where the token doesn't support ERC-3009.
+/// The facilitator must be pre-approved by the sender.
+pub struct TransferFromCall<P> {
+    /// The prepared call builder that can be `.call()`ed or `.send()`ed.
+    pub tx: SolCallBuilder<P, USDC::transferFromCall>,
+    /// The sender (`from`) address.
+    pub from: alloy::primitives::Address,
+    /// The recipient (`to`) address.
+    pub to: alloy::primitives::Address,
+    /// The amount to transfer.
+    pub value: U256,
     /// Address of the token contract used for this transfer.
     pub contract_address: alloy::primitives::Address,
 }
@@ -793,6 +1034,50 @@ fn assert_enough_value(
 ) -> Result<(), FacilitatorLocalError> {
     if sent < max_amount_required {
         Err(FacilitatorLocalError::InsufficientValue((*payer).into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Verifies that the user has approved the facilitator (spender) for at least the required amount.
+///
+/// Used for allowance-based transfers on chains like BNB where USDC doesn't support ERC-3009.
+///
+/// # Errors
+/// Returns [`FacilitatorLocalError::InsufficientAllowance`] if the allowance is below the required amount.
+#[instrument(skip_all, err, fields(
+    owner = %owner,
+    spender = %spender,
+    required = %required,
+    token_contract = %usdc_contract.address()
+))]
+async fn assert_enough_allowance<P: Provider>(
+    usdc_contract: &USDC::USDCInstance<P>,
+    owner: &EvmAddress,
+    spender: &Address,
+    required: U256,
+) -> Result<(), FacilitatorLocalError> {
+    let allowance = usdc_contract
+        .allowance(owner.0, *spender)
+        .call()
+        .into_future()
+        .instrument(tracing::info_span!(
+            "fetch_token_allowance",
+            token_contract = %usdc_contract.address(),
+            owner = %owner,
+            spender = %spender,
+            otel.kind = "client"
+        ))
+        .await
+        .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+
+    if allowance < required {
+        Err(FacilitatorLocalError::InsufficientAllowance {
+            owner: (*owner).into(),
+            spender: *spender,
+            required,
+            actual: allowance,
+        })
     } else {
         Ok(())
     }
@@ -908,9 +1193,16 @@ async fn assert_valid_payment<P: Provider>(
     requirements: &PaymentRequirements,
 ) -> Result<(USDC::USDCInstance<P>, ExactEvmPayment, Eip712Domain), FacilitatorLocalError> {
     let payment_payload = match &payload.payload {
-        ExactPaymentPayload::Evm(payload) => payload,
-        ExactPaymentPayload::Solana(_) => {
+        SchemePayload::Exact(ExactPaymentPayload::Evm(p)) => p,
+        SchemePayload::Exact(ExactPaymentPayload::Solana(_)) => {
             return Err(FacilitatorLocalError::UnsupportedNetwork(None));
+        }
+        SchemePayload::Allowance(_) => {
+            return Err(FacilitatorLocalError::SchemeMismatch(
+                None,
+                Scheme::Exact,
+                Scheme::Allowance,
+            ));
         }
     };
     let payer = payment_payload.authorization.from;
@@ -928,13 +1220,9 @@ async fn assert_valid_payment<P: Provider>(
             requirements.network,
         ));
     }
-    if payload.scheme != requirements.scheme {
-        return Err(FacilitatorLocalError::SchemeMismatch(
-            Some(payer.into()),
-            requirements.scheme,
-            payload.scheme,
-        ));
-    }
+    // Note: We don't check payload.scheme vs requirements.scheme here because
+    // routing is done by requirements.scheme in verify/settle, and legacy clients
+    // may send "exact" even for allowance-based networks.
     let payload_to: EvmAddress = payment_payload.authorization.to;
     let requirements_to: EvmAddress = requirements
         .pay_to
@@ -984,6 +1272,115 @@ async fn assert_valid_payment<P: Provider>(
     Ok((contract, payment, domain))
 }
 
+/// Validates an allowance-based payment payload for BNB Chain.
+///
+/// Performs similar checks to `assert_valid_payment` but for the allowance scheme:
+/// - Network and scheme must match.
+/// - Receiver addresses must match.
+/// - Authorization must not be expired.
+/// - Sender must have sufficient balance.
+/// - Sender must have sufficient allowance for the facilitator.
+/// - Value must be sufficient.
+#[instrument(skip_all, err)]
+async fn assert_valid_allowance_payment<P: Provider>(
+    provider: P,
+    chain: &EvmChain,
+    payload: &PaymentPayload,
+    requirements: &PaymentRequirements,
+    facilitator_address: &Address,
+) -> Result<(USDC::USDCInstance<P>, AllowanceEvmPayment, Eip712Domain), FacilitatorLocalError> {
+    let payment_payload = match &payload.payload {
+        SchemePayload::Allowance(AllowancePaymentPayload::Evm(p)) => p,
+        _ => {
+            return Err(FacilitatorLocalError::UnsupportedNetwork(None));
+        }
+    };
+    let payer = payment_payload.authorization.from;
+    if payload.network != chain.network {
+        return Err(FacilitatorLocalError::NetworkMismatch(
+            Some(payer.into()),
+            chain.network,
+            payload.network,
+        ));
+    }
+    if requirements.network != chain.network {
+        return Err(FacilitatorLocalError::NetworkMismatch(
+            Some(payer.into()),
+            chain.network,
+            requirements.network,
+        ));
+    }
+    // Note: We don't check payload.scheme here because routing is done by
+    // requirements.scheme in verify/settle, and legacy clients may send "exact"
+    // even for allowance-based networks.
+    let payload_to: EvmAddress = payment_payload.authorization.to;
+    let requirements_to: EvmAddress = requirements
+        .pay_to
+        .clone()
+        .try_into()
+        .map_err(|e| FacilitatorLocalError::InvalidAddress(format!("{e:?}")))?;
+    if payload_to != requirements_to {
+        return Err(FacilitatorLocalError::ReceiverMismatch(
+            payer.into(),
+            payload_to.to_string(),
+            requirements_to.to_string(),
+        ));
+    }
+
+    // Allowance scheme only has valid_before (no valid_after)
+    let valid_before = payment_payload.authorization.valid_before;
+    let now = UnixTimestamp::try_now().map_err(FacilitatorLocalError::ClockError)?;
+    if valid_before < now + 6 {
+        return Err(FacilitatorLocalError::InvalidTiming(
+            payer.into(),
+            format!("Expired: now {} > valid_before {}", now + 6, valid_before),
+        ));
+    }
+
+    let asset_address: Address = requirements
+        .asset
+        .clone()
+        .try_into()
+        .map_err(|e| FacilitatorLocalError::InvalidAddress(format!("{e:?}")))?;
+    let contract = USDC::new(asset_address, provider);
+
+    let domain = assert_domain(chain, &contract, payload, &asset_address, requirements).await?;
+
+    let amount_required = requirements.max_amount_required.0;
+
+    // Check balance
+    assert_enough_balance(
+        &contract,
+        &payment_payload.authorization.from,
+        amount_required,
+    )
+    .await?;
+
+    // Check allowance - user must have approved the facilitator
+    assert_enough_allowance(
+        &contract,
+        &payment_payload.authorization.from,
+        facilitator_address,
+        amount_required,
+    )
+    .await?;
+
+    let value: U256 = payment_payload.authorization.value.into();
+    assert_enough_value(&payer, &value, &amount_required)?;
+
+    let payment = AllowanceEvmPayment {
+        chain: *chain,
+        from: payment_payload.authorization.from,
+        to: payment_payload.authorization.to,
+        value: payment_payload.authorization.value,
+        valid_before: payment_payload.authorization.valid_before,
+        nonce: payment_payload.authorization.nonce,
+        signature: payment_payload.signature.clone(),
+    };
+
+    Ok((contract, payment, domain))
+}
+
 /// Constructs a full `transferWithAuthorization` call for a verified payment payload.
 ///
 /// This function prepares the transaction builder with gas pricing adapted to the network's
@@ -1021,6 +1418,29 @@ async fn transferWithAuthorization_0<'a, P: Provider>(
         valid_before,
         nonce,
         signature,
+        contract_address: *contract.address(),
+    })
+}
+
+/// Constructs a `transferFrom` call for allowance-based transfers.
+///
+/// Used on chains like BNB where USDC doesn't support ERC-3009.
+/// The facilitator must be pre-approved by the sender.
+///
+/// This function does not perform any validation — it assumes inputs are already checked.
+async fn transfer_from<'a, P: Provider>(
+    contract: &'a USDC::USDCInstance<P>,
+    payment: &AllowanceEvmPayment,
+) -> Result<TransferFromCall<&'a P>, FacilitatorLocalError> {
+    let from: Address = payment.from.into();
+    let to: Address = payment.to.into();
+    let value: U256 = payment.value.into();
+    let tx = contract.transferFrom(from, to, value);
+    Ok(TransferFromCall {
+        tx,
+        from,
+        to,
+        value,
         contract_address: *contract.address(),
     })
 }
@@ -1099,6 +1519,40 @@ impl SignedMessage {
         };
         let eip712_hash = transfer_with_authorization.eip712_signing_hash(domain);
         let expected_address = payment.from;
+        let structured_signature: StructuredSignature = payment.signature.clone().try_into()?;
+        let signed_message = Self {
+            address: expected_address.into(),
+            hash: eip712_hash,
+            signature: structured_signature,
+        };
+        Ok(signed_message)
+    }
+
+    /// Construct a [`SignedMessage`] from an [`AllowanceEvmPayment`] and its
+    /// corresponding [`Eip712Domain`].
+    ///
+    /// Similar to `extract`, but for the allowance scheme used on BNB Chain.
+    /// The main difference is the struct being signed (`AllowanceTransfer` instead of
+    /// `TransferWithAuthorization`), and we only support EOA signatures (no EIP-6492).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacilitatorLocalError`] if:
+    /// - The raw signature cannot be decoded.
+    pub fn extract_allowance(
+        payment: &AllowanceEvmPayment,
+        domain: &Eip712Domain,
+    ) -> Result<Self, FacilitatorLocalError> {
+        let allowance_transfer = AllowanceTransfer {
+            from: payment.from.0,
+            to: payment.to.0,
+            value: payment.value.into(),
+            validBefore: payment.valid_before.into(),
+            nonce: FixedBytes(payment.nonce.0),
+        };
+        let eip712_hash = allowance_transfer.eip712_signing_hash(domain);
+        let expected_address = payment.from;
+        // For allowance scheme, we only support plain EOA signatures (no EIP-6492)
         let structured_signature: StructuredSignature = payment.signature.clone().try_into()?;
         let signed_message = Self {
             address: expected_address.into(),

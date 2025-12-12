@@ -1,5 +1,7 @@
 use std::time::SystemTimeError;
 
+use alloy::primitives::{Address, U256};
+
 use crate::chain::evm::EvmProvider;
 use crate::chain::solana::SolanaProvider;
 use crate::facilitator::Facilitator;
@@ -121,6 +123,14 @@ pub enum FacilitatorLocalError {
     /// The payload's `value` is not enough to meet the requirements.
     #[error("Insufficient value")]
     InsufficientValue(MixedAddress),
+    /// The user's allowance for the facilitator is insufficient for the payment.
+    #[error("Insufficient allowance: owner has approved {actual} but {required} is required")]
+    InsufficientAllowance {
+        owner: MixedAddress,
+        spender: Address,
+        required: U256,
+        actual: U256,
+    },
     /// The payload decoding failed.
     #[error("Decoding error: {0}")]
     DecodingError(String),

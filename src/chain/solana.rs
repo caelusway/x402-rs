@@ -18,10 +18,10 @@ use crate::from_env;
 use crate::network::Network;
 use crate::types::{
     Base64Bytes, ExactPaymentPayload, FacilitatorErrorReason, MixedAddress, PaymentRequirements,
-    SettleRequest, SettleResponse, SupportedPaymentKind, SupportedPaymentKindExtra,
-    SupportedPaymentKindsResponse, TokenAmount, TransactionHash, VerifyRequest, VerifyResponse,
+    Scheme, SchemePayload, SettleRequest, SettleResponse, SupportedPaymentKind,
+    SupportedPaymentKindExtra, SupportedPaymentKindsResponse, TokenAmount, TransactionHash,
+    VerifyRequest, VerifyResponse, X402Version,
 };
-use crate::types::{Scheme, X402Version};
 
 const ATA_PROGRAM_PUBKEY: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
@@ -459,10 +459,17 @@ impl SolanaProvider {
 
         // Assert valid payment START
         let payment_payload = match &payload.payload {
-            ExactPaymentPayload::Evm(..) => {
+            SchemePayload::Exact(ExactPaymentPayload::Evm(..)) => {
                 return Err(FacilitatorLocalError::UnsupportedNetwork(None));
             }
-            ExactPaymentPayload::Solana(payload) => payload,
+            SchemePayload::Exact(ExactPaymentPayload::Solana(p)) => p,
+            SchemePayload::Allowance(_) => {
+                return Err(FacilitatorLocalError::SchemeMismatch(
+                    None,
+                    Scheme::Exact,
+                    Scheme::Allowance,
+                ));
+            }
         };
         if payload.network != self.network() {
             return Err(FacilitatorLocalError::NetworkMismatch(
@@ -663,7 +670,8 @@ impl Facilitator for SolanaProvider {
             scheme: Scheme::Exact,
             x402_version: X402Version::V1,
             extra: Some(SupportedPaymentKindExtra {
-                fee_payer: self.signer_address(),
+                fee_payer: Some(self.signer_address()),
+                facilitator_address: None,
             }),
         }];
         Ok(SupportedPaymentKindsResponse { kinds })

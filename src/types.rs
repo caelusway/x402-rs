@@ -84,18 +84,24 @@ impl<'de> Deserialize<'de> for X402Version {
     }
 }
 
-/// Enumerates payment schemes. Only "exact" is supported in this implementation,
-/// meaning the amount to be transferred must match exactly.
+/// Enumerates payment schemes supported by the x402 protocol.
+///
+/// - `Exact`: Uses ERC-3009 `transferWithAuthorization` for gasless transfers (most chains)
+/// - `Allowance`: Uses pre-approved allowance + `transferFrom` (BNB Chain)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scheme {
+    /// ERC-3009 transferWithAuthorization - gasless for user
     Exact,
+    /// Pre-approved allowance + transferFrom - user must approve first
+    Allowance,
 }
 
 impl Display for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Scheme::Exact => "exact",
+            Scheme::Allowance => "allowance",
         };
         write!(f, "{s}")
     }
@@ -281,11 +287,49 @@ pub struct ExactSolanaPayload {
     pub transaction: String,
 }
 
+/// Authorization data for allowance-based transfers (BNB Chain).
+/// User signs this to prove intent, facilitator uses pre-approved allowance.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllowanceEvmPayloadAuthorization {
+    pub from: EvmAddress,
+    pub to: EvmAddress,
+    pub value: TokenAmount,
+    pub valid_before: UnixTimestamp,
+    pub nonce: HexEncodedNonce,
+}
+
+/// Full payload for allowance-based transfer.
+/// Used on chains where USDC doesn't support ERC-3009 (e.g., BNB Chain).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllowanceEvmPayload {
+    pub signature: EvmSignature,
+    pub authorization: AllowanceEvmPayloadAuthorization,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExactPaymentPayload {
     Evm(ExactEvmPayload),
     Solana(ExactSolanaPayload),
+}
+
+/// Payment payload for allowance-based scheme.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AllowancePaymentPayload {
+    Evm(AllowanceEvmPayload),
+}
+
+/// Union of all payment payload types across schemes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SchemePayload {
+    /// ERC-3009 transferWithAuthorization payloads
+    Exact(ExactPaymentPayload),
+    /// Allowance-based transferFrom payloads
+    Allowance(AllowancePaymentPayload),
 }
 
 /// Describes a signed request to transfer a specific amount of funds on-chain.
@@ -296,7 +340,7 @@ pub struct PaymentPayload {
     pub x402_version: X402Version,
     pub scheme: Scheme,
     pub network: Network,
-    pub payload: ExactPaymentPayload,
+    pub payload: SchemePayload,
 }
 
 /// Error returned when decoding a base64-encoded [`PaymentPayload`] fails.
@@ -921,6 +965,10 @@ pub enum FacilitatorErrorReason {
     #[error("unexpected_settle_error")]
     #[serde(rename = "unexpected_settle_error")]
     UnexpectedSettleError,
+    /// The user's allowance for the facilitator is insufficient.
+    #[error("insufficient_allowance")]
+    #[serde(rename = "insufficient_allowance")]
+    InsufficientAllowance,
     #[error("{0}")]
     FreeForm(String),
 }
@@ -1407,7 +1455,12 @@ pub struct SupportedPaymentKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupportedPaymentKindExtra {
-    pub fee_payer: MixedAddress,
+    /// The fee payer address (Solana).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_payer: Option<MixedAddress>,
+    /// The facilitator address that users must approve (allowance scheme).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facilitator_address: Option<MixedAddress>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1433,6 +1486,22 @@ sol!(
         address to;
         uint256 value;
         uint256 validAfter;
+        uint256 validBefore;
+        bytes32 nonce;
+    }
+);
+
+sol!(
+    /// Solidity-compatible struct for allowance-based transfer authorization.
+    ///
+    /// Used for BNB Chain where USDC doesn't support ERC-3009.
+    /// The user signs this struct to authorize a transfer using pre-approved allowance.
+    /// Unlike ERC-3009, this requires the user to have called `approve()` beforehand.
+    #[derive(Serialize, Deserialize)]
+    struct AllowanceTransfer {
+        address from;
+        address to;
+        uint256 value;
         uint256 validBefore;
         bytes32 nonce;
     }

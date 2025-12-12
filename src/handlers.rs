@@ -215,6 +215,14 @@ impl IntoResponse for FacilitatorLocalError {
                 )),
             )
                 .into_response(),
+            FacilitatorLocalError::InsufficientAllowance { owner, .. } => (
+                StatusCode::OK,
+                Json(VerifyResponse::invalid(
+                    Some(owner),
+                    FacilitatorErrorReason::InsufficientAllowance,
+                )),
+            )
+                .into_response(),
         }
     }
 }
